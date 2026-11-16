@@ -14,28 +14,82 @@ import (
 
 var log, Log = xlog.New("acmetool.solver")
 
-type blacklist struct {
-	mutex sync.Mutex
-	m     map[string]struct{}
+// challengeFailures records challenges which have failed during an ordering
+// process, so that unsuitable challenges can be avoided where appropriate.
+//
+// Failures are recorded at one of two scopes, according to whether the error
+// which caused the failure is retryable or fatal:
+//
+//   - Retryable failures are scoped to the individual authorization in which
+//     they occurred (and thereby to the current order, since an authorization
+//     belongs to exactly one order). They suppress the failed challenge only
+//     within that authorization: other authorizations in the same order —
+//     even for the same hostname — are unaffected, and if the order has to be
+//     rebuilt, the challenges of the new order's authorizations are
+//     re-evaluated from scratch, since a retryable failure (e.g. a transient
+//     network or hook error) may not recur.
+//
+//   - Fatal failures are scoped to a hostname for the duration of the
+//     ordering process. A fatal failure means the challenge cannot succeed
+//     for the hostname no matter how many times the order is rebuilt (e.g.
+//     no responder is configured for the challenge type, or the server
+//     definitively rejected the challenge), so the challenge is suppressed
+//     for all authorizations for that hostname in the current order and any
+//     rebuilt orders. This also guarantees the ordering process terminates.
+type challengeFailures struct {
+	mutex     sync.Mutex
+	retryable map[string]struct{}
+	fatal     map[string]struct{}
 }
 
-func blacklistKey(hostname, challengeType string) string {
+func newChallengeFailures() *challengeFailures {
+	return &challengeFailures{
+		retryable: map[string]struct{}{},
+		fatal:     map[string]struct{}{},
+	}
+}
+
+func retryableFailureKey(authzURL, challengeType string) string {
+	return challengeType + "\n" + authzURL
+}
+
+func fatalFailureKey(hostname, challengeType string) string {
 	return challengeType + "\n" + hostname
 }
 
-func (b *blacklist) Check(hostname, challengeType string) bool {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+// Determines whether the given challenge should be avoided for the given
+// authorization, either because it failed retryably in this authorization or
+// because it failed fatally for this authorization's hostname.
+func (cf *challengeFailures) Check(authz *acmeapi.Authorization, challengeType string) bool {
+	cf.mutex.Lock()
+	defer cf.mutex.Unlock()
 
-	_, ok := b.m[blacklistKey(hostname, challengeType)]
+	_, ok := cf.retryable[retryableFailureKey(authz.URL, challengeType)]
+	if ok {
+		return true
+	}
+
+	_, ok = cf.fatal[fatalFailureKey(authz.Identifier.Value, challengeType)]
 	return ok
 }
 
-func (b *blacklist) Add(hostname, challengeType string) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+// Records a retryable failure of the given challenge in the given
+// authorization. The failure is forgotten as soon as the order is rebuilt.
+func (cf *challengeFailures) AddRetryable(authz *acmeapi.Authorization, challengeType string) {
+	cf.mutex.Lock()
+	defer cf.mutex.Unlock()
 
-	b.m[blacklistKey(hostname, challengeType)] = struct{}{}
+	cf.retryable[retryableFailureKey(authz.URL, challengeType)] = struct{}{}
+}
+
+// Records a fatal failure of the given challenge type for the given hostname.
+// The failure persists for the duration of the ordering process, including
+// across order rebuilds.
+func (cf *challengeFailures) AddFatal(hostname, challengeType string) {
+	cf.mutex.Lock()
+	defer cf.mutex.Unlock()
+
+	cf.fatal[fatalFailureKey(hostname, challengeType)] = struct{}{}
 }
 
 // Creates, fulfils and finalises an order. Automatically tries different
@@ -47,13 +101,13 @@ func Order(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, 
 	// Progress the order. => result: Success | Retry | Fail
 
 	// Fulfil authorizations.
-	//   Fulfil challenges by preference/previously failed info; keep prev. failed for (hostname, challenge type)
+	//   Fulfil challenges by preference/previously failed info; keep prev. failed per (authorization, challenge type)
 	//   Retry stuff
 	//   Start again if authorization becomes permanently failed
 	//   Have faith
 	// Finalise
 
-	bl := blacklist{m: map[string]struct{}{}}
+	cf := newChallengeFailures()
 
 	for {
 		order := *orderTemplate
@@ -63,7 +117,7 @@ func Order(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, 
 			return nil, err
 		}
 
-		shouldRetry, err := orderProcess(ctx, rc, acct, &order, csr, ccfg, &bl)
+		shouldRetry, err := orderProcess(ctx, rc, acct, &order, csr, ccfg, cf)
 		if err == nil {
 			return &order, nil
 		}
@@ -82,7 +136,7 @@ func Order(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, 
 //       Causes a new order to be made to start the process again.
 //   - Fatal:   shouldRetry == false, err != nil	-- Order failed and we will never succeed, so stop
 //       Stops the order process.
-func orderProcess(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, order *acmeapi.Order, csr []byte, ccfg *responder.ChallengeConfig, bl *blacklist) (shouldRetry bool, err error) {
+func orderProcess(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, order *acmeapi.Order, csr []byte, ccfg *responder.ChallengeConfig, cf *challengeFailures) (shouldRetry bool, err error) {
 	// We just created the order, so it shouldn't be invalid. If it is, there's
 	// no way we can get anywhere no matter how many times we try..
 	switch order.Status {
@@ -94,7 +148,7 @@ func orderProcess(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Ac
 	}
 
 	if order.Status == acmeapi.OrderPending {
-		shouldRetry, err := orderAuthorizeAll(ctx, rc, acct, order, ccfg, bl)
+		shouldRetry, err := orderAuthorizeAll(ctx, rc, acct, order, ccfg, cf)
 		if err != nil {
 			return shouldRetry, err
 		}
@@ -133,7 +187,7 @@ func orderProcess(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Ac
 //       Cause a new order to be made to start the process again.
 //   - Fatal:    shouldRetry == false, err != nil  -- One or more authorizations are unfulfillable and subsequent orders will never succeed
 //       Stops the order process.
-func orderAuthorizeAll(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, order *acmeapi.Order, ccfg *responder.ChallengeConfig, bl *blacklist) (shouldRetry bool, err error) {
+func orderAuthorizeAll(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, order *acmeapi.Order, ccfg *responder.ChallengeConfig, cf *challengeFailures) (shouldRetry bool, err error) {
 	type result struct {
 		isFatal bool
 		err     error
@@ -145,7 +199,7 @@ func orderAuthorizeAll(ctx context.Context, rc *acmeapi.RealmClient, acct *acmea
 		authURL := order.AuthorizationURLs[i]
 		go func() {
 			ctxAuth := ctx // TODO
-			isFatal, err := orderAuthorizeOne(ctxAuth, rc, acct, authURL, ccfg, bl)
+			isFatal, err := orderAuthorizeOne(ctxAuth, rc, acct, authURL, ccfg, cf)
 			ch <- result{isFatal, err}
 		}()
 	}
@@ -173,22 +227,23 @@ func orderAuthorizeAll(ctx context.Context, rc *acmeapi.RealmClient, acct *acmea
 
 // Tries to complete one authorization given the URL to it. Tries challenges in
 // sequence until the authorization becomes invalid or it is determined that
-// none of the challenges will work. Avoids challenges which are already
-// blacklisted and blacklists challenges which fail for the given (hostname,
-// challengeType).
+// none of the challenges will work. Avoids challenges which have already
+// failed and records challenges which fail, scoped according to whether the
+// failure is retryable (to this authorization only) or fatal (to this
+// hostname for the remainder of the ordering process).
 //
 // Returns in one of three states:
 //   - Success:                           err == nil  -- OK
 //       We're done, authorization is now good
 //   - Fail:            isFatal == false, err != nil  -- Authorization is unfulfillable but subsequent orders might succeed
 //       Cause a new order to be made to start the process again. Challenge
-//       blacklisting means a different strategy to complete the authorization
-//       will be attempted next time.
+//       failure records mean a different strategy to complete the
+//       authorization may be attempted next time.
 //   - Fatal:           isFatal == true,  err != nil  -- Authorization is unfulfillable and subsequent orders will never succeed
 //       Authorization process failed and it has been determined that no
 //       corresponding successor authorization in a subsequent order could ever
 //       succeed either. Give up.
-func orderAuthorizeOne(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, authURL string, ccfg *responder.ChallengeConfig, bl *blacklist) (isFatal bool, err error) {
+func orderAuthorizeOne(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, authURL string, ccfg *responder.ChallengeConfig, cf *challengeFailures) (isFatal bool, err error) {
 	authz := &acmeapi.Authorization{
 		URL: authURL,
 	}
@@ -264,7 +319,7 @@ func orderAuthorizeOne(ctx context.Context, rc *acmeapi.RealmClient, acct *acmea
 		secondBestPreferred := ""
 		for _, i := range preferenceOrder {
 			ch := &authz.Challenges[i]
-			if !bl.Check(authz.Identifier.Value, ch.Type) && !ch.Status.IsFinal() {
+			if !cf.Check(authz, ch.Type) && !ch.Status.IsFinal() {
 				if preferred == "" {
 					preferred = ch.URL
 				} else if secondBestPreferred == "" {
@@ -275,14 +330,15 @@ func orderAuthorizeOne(ctx context.Context, rc *acmeapi.RealmClient, acct *acmea
 			}
 		}
 
-		// If we've blacklisted all challenges, return FATAL.
+		// If we've exhausted all challenges, return FATAL.
 		if preferred == "" {
 			err = util.NewWrapError(challengeErrors, "exhausted all possible challenges in authorization %q", authz.URL)
 			isFatal = true
 			return
 		}
 
-		// Try and complete our preferred challenge. If it fails, blacklist it.
+		// Try and complete our preferred challenge. If it fails, record the
+		// failure.
 		// orderCompleteChallenge returns once the challenge has succeeded, or once
 		// it has been determined that it definitely cannot be completed, or once a
 		// reasonable effort has been made (e.g. retry limit reached) without
@@ -295,19 +351,27 @@ func orderAuthorizeOne(ctx context.Context, rc *acmeapi.RealmClient, acct *acmea
 		}
 
 		var authWasLoaded bool
-		authWasLoaded, err = orderCompleteChallenge(ctx, rc, acct, authz, ch.URL, ccfg)
+		var failureIsFatal bool
+		authWasLoaded, failureIsFatal, err = orderCompleteChallenge(ctx, rc, acct, authz, ch.URL, ccfg)
 		if err != nil {
-			// This (hostname, challengeType) failed, so blacklist it so we don't try
-			// it again for the duration of this ordering process.
-			bl.Add(authz.Identifier.Value, ch.Type)
+			// This challenge failed, so record the failure so we don't try it
+			// again where it cannot succeed. Retryable failures are remembered
+			// only for this authorization, so the challenge is re-evaluated if
+			// the order is rebuilt; fatal failures are remembered for the
+			// hostname for the duration of this ordering process.
+			if failureIsFatal {
+				cf.AddFatal(authz.Identifier.Value, ch.Type)
+			} else {
+				cf.AddRetryable(authz, ch.Type)
+			}
 
 			// As an optimisation, return FATAL instead of FAIL if the challenge we
-			// just blacklisted was the final non-blacklisted challenge. This is an
+			// just recorded was the final untried challenge. This is an
 			// optimization; if we don't do this, we'll create another order and call
 			// this function, orderAuthorizeOne, again before bailing at "exhausted
 			// all possible challenges" above. We can avoid this unnecessary creation
-			// of an unused order by checking if this is the last non-blacklisted
-			// challenge we're blacklisting.
+			// of an unused order by checking if this is the last untried
+			// challenge we're recording a failure for.
 			outOfChallenges = (secondBestPreferred == "")
 
 			// Record the error.
@@ -357,10 +421,22 @@ func orderAuthorizeOne(ctx context.Context, rc *acmeapi.RealmClient, acct *acmea
 // As an optimization, we return whether we reloaded the authorization after
 // any possible status changes, which means the caller doesn't need to reload
 // it again.
-func orderCompleteChallenge(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, authz *acmeapi.Authorization, challengeURL string, ccfg *responder.ChallengeConfig) (authWasLoaded bool, err error) {
+//
+// In failure cases, we also return whether the failure is fatal for the
+// (hostname, challenge type) pair. A fatal failure is one which demonstrates
+// that the challenge cannot possibly be completed for the hostname no matter
+// how many times the order is rebuilt — for example, no responder could be
+// instantiated for the challenge type, or the server rejected the challenge
+// into a final non-valid status. All other failures (e.g. hook errors,
+// self-test errors, network errors talking to the ACME server, or non-final
+// server-side errors) are considered retryable: they may not recur, so the
+// challenge is avoided only within the current authorization and is
+// re-evaluated if the order is rebuilt.
+func orderCompleteChallenge(ctx context.Context, rc *acmeapi.RealmClient, acct *acmeapi.Account, authz *acmeapi.Authorization, challengeURL string, ccfg *responder.ChallengeConfig) (authWasLoaded, failureIsFatal bool, err error) {
 	oldCh, ok := findChallengeByURL(authz, challengeURL)
 	if !ok {
 		err = fmt.Errorf("challenge %q does not appear in authorization %q", challengeURL, authz.URL)
+		failureIsFatal = true
 		return
 	}
 
@@ -380,6 +456,10 @@ func orderCompleteChallenge(ctx context.Context, rc *acmeapi.RealmClient, acct *
 		ChallengeConfig: *ccfg,
 	})
 	if err != nil {
+		// We couldn't even instantiate a responder for this challenge type,
+		// so it cannot be completed in any successor authorization either.
+		// This is a fatal failure.
+		failureIsFatal = true
 		log.Debuge(err, "challenge instantiation failed")
 		return
 	}
@@ -442,7 +522,9 @@ func orderCompleteChallenge(ctx context.Context, rc *acmeapi.RealmClient, acct *
 
 		if updatedCh.Status.IsFinal() {
 			// The challenge is final but not valid; there is no further prospect of
-			// completing this challenge.
+			// completing this challenge. The server has definitively rejected
+			// the challenge, so this is a fatal failure.
+			failureIsFatal = true
 			err = util.NewWrapError(updatedCh.Error, "authorization %q challenge %q failed into final non-valid status %v", authz.URL, challengeURL, updatedCh.Status)
 			log.Infoe(err, "unsuccessful challenge")
 			return
